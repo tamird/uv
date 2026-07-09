@@ -56,7 +56,7 @@ use uv_pypi_types::{
 };
 use uv_redacted::{DisplaySafeUrl, DisplaySafeUrlError};
 use uv_small_str::SmallString;
-use uv_types::{BuildContext, HashStrategy};
+use uv_types::{BuildContext, DependencyTraversal, HashStrategy};
 use uv_warnings::warn_user_once;
 use uv_workspace::{Editability, WorkspaceMember};
 
@@ -1732,17 +1732,10 @@ impl Lock {
     {
         // Enqueue a dependency for auditability checks: base package (no extra) first, then each activated extra.
         fn enqueue_dep<'lock>(
-            lock: &'lock Lock,
-            seen: &mut FxHashSet<(&'lock PackageId, Option<&'lock ExtraName>)>,
-            queue: &mut VecDeque<(&'lock Package, Option<&'lock ExtraName>)>,
             dep: &'lock Dependency,
+            traversal: &mut DependencyTraversal<&'lock PackageId, &'lock ExtraName>,
         ) {
-            let dep_pkg = lock.find_by_id(&dep.package_id);
-            for maybe_extra in std::iter::once(None).chain(dep.extra.iter().map(Some)) {
-                if seen.insert((&dep.package_id, maybe_extra)) {
-                    queue.push_back((dep_pkg, maybe_extra));
-                }
-            }
+            traversal.enqueue_package(&dep.package_id, dep.extra.iter());
         }
 
         // Identify workspace members (the implicit root counts for single-member workspaces).
@@ -1756,9 +1749,7 @@ impl Lock {
                 .collect()
         };
 
-        // Lockfile traversal state: (package, optional extra to activate on that package).
-        let mut queue: VecDeque<(&Package, Option<&ExtraName>)> = VecDeque::new();
-        let mut seen: FxHashSet<(&PackageId, Option<&ExtraName>)> = FxHashSet::default();
+        let mut traversal = DependencyTraversal::default();
 
         // Seed from workspace members. Always queue with `None` so that we can traverse
         // their dependency groups; only queue extras when prod mode is active.
@@ -1767,15 +1758,13 @@ impl Lock {
             .iter()
             .filter(|p| workspace_member_ids.contains(&p.id))
         {
-            if seen.insert((&package.id, None)) {
-                queue.push_back((package, None));
-            }
             if groups.prod() {
-                for extra in extras.extra_names(package.optional_dependencies.keys()) {
-                    if seen.insert((&package.id, Some(extra))) {
-                        queue.push_back((package, Some(extra)));
-                    }
-                }
+                traversal.enqueue_package(
+                    &package.id,
+                    extras.extra_names(package.optional_dependencies.keys()),
+                );
+            } else {
+                traversal.enqueue(&package.id, None);
             }
         }
 
@@ -1786,14 +1775,7 @@ impl Lock {
                 .iter()
                 .filter(|p| p.id.name == requirement.name)
             {
-                if seen.insert((&package.id, None)) {
-                    queue.push_back((package, None));
-                }
-                for extra in &*requirement.extras {
-                    if seen.insert((&package.id, Some(extra))) {
-                        queue.push_back((package, Some(extra)));
-                    }
-                }
+                traversal.enqueue_package(&package.id, requirement.extras.iter());
             }
         }
 
@@ -1809,19 +1791,13 @@ impl Lock {
                     .iter()
                     .filter(|p| p.id.name == requirement.name)
                 {
-                    if seen.insert((&package.id, None)) {
-                        queue.push_back((package, None));
-                    }
-                    for extra in &*requirement.extras {
-                        if seen.insert((&package.id, Some(extra))) {
-                            queue.push_back((package, Some(extra)));
-                        }
-                    }
+                    traversal.enqueue_package(&package.id, requirement.extras.iter());
                 }
             }
         }
 
-        while let Some((package, extra)) = queue.pop_front() {
+        traversal.walk(|package_id, extra, traversal| {
+            let package = self.find_by_id(package_id);
             let is_member = workspace_member_ids.contains(&package.id);
 
             // Collect non-workspace packages that have version information
@@ -1845,7 +1821,7 @@ impl Lock {
                     .filter(|(group, _)| groups.contains(group))
                     .flat_map(|(_, deps)| deps)
                 {
-                    enqueue_dep(self, &mut seen, &mut queue, dep);
+                    enqueue_dep(dep, traversal);
                 }
             }
 
@@ -1862,9 +1838,9 @@ impl Lock {
             };
 
             for dep in dependencies {
-                enqueue_dep(self, &mut seen, &mut queue, dep);
+                enqueue_dep(dep, traversal);
             }
-        }
+        });
     }
 
     /// Return the workspace root used to generate this lock.
