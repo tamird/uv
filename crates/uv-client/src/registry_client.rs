@@ -30,12 +30,14 @@ use uv_normalize::PackageName;
 use uv_pep440::{Version, VersionSpecifiers};
 use uv_pep508::MarkerEnvironment;
 use uv_platform_tags::Platform;
+use uv_preview::PreviewFeature;
 use uv_pypi_types::{HashAlgorithm, HashDigest, HashDigests, ProjectStatus, Yanked};
 use uv_pypi_types::{PypiSimpleDetail, PypiSimpleIndex, ResolutionMetadata};
 use uv_redacted::DisplaySafeUrl;
 use uv_small_str::SmallString;
 use uv_static::{EnvVars, parse_boolish_environment_variable};
 use uv_torch::TorchStrategy;
+use uv_warnings::warn_user_once;
 
 use crate::base_client::{BaseClientBuilder, ClientBuildError, ExtraMiddleware, RedirectPolicy};
 use crate::cached_client::CacheControl;
@@ -170,6 +172,18 @@ impl<'a> RegistryClientBuilder<'a> {
                 parse_boolish_environment_variable(EnvVars::UV_REQUIRE_METADATA_RANGE_REQUESTS)?
                     .unwrap_or(false)
             };
+
+        if self.index_locations.proxy_indexes().next().is_some()
+            && !self
+                .base_client_builder
+                .preview()
+                .is_enabled(PreviewFeature::ProxyIndex)
+        {
+            warn_user_once!(
+                "Proxy indexes are experimental and may change without warning. Pass `--preview-features {}` to disable this warning.",
+                PreviewFeature::ProxyIndex
+            );
+        }
 
         // Cache explicitly configured credentials for indexes and proxy artifact hosts.
         for index in self
